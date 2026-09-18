@@ -1,129 +1,46 @@
 <?php
-require_once dirname(__DIR__).'/config.php';
-header('Content-Type: application/json; charset=utf-8');
-$conn=db(); $qr=trim($_POST['qr']??''); $eventId=(int)($_POST['event_id']??0);
-register_shutdown_function(function () use ($conn) { @$conn->rollback(); });
-if(!$qr||!$eventId){echo json_encode(['ok'=>false,'title'=>'SCAN DENIED','message'=>'A valid student code and event are required.']);exit;}
-function scan_response($payload, $status = 200) {
-	global $student;
-	if (isset($payload['grade']) && isset($student['course'])) {
-		$payload['course'] = $student['course'];
-		$payload['grade'] = $student['year_level'] ?? '';
-	}
-	http_response_code($status);
-	echo json_encode($payload);
-	exit;
+require_once __DIR__.'/config.php';
+$conn = db();
+$event = active_event($conn);
+$recent = [];
+if ($event) {
+    $query = $conn->prepare('SELECT a.scan_in,a.scan_out,a.attendance_status,s.first_name,s.last_name,s.course,s.year_level,s.section FROM event_attendance a JOIN students s ON s.id=a.student_id WHERE a.event_id=? ORDER BY a.attendance_id DESC LIMIT 10');
+    $query->bind_param('i', $event['id']);
+    $query->execute();
+    $recent = $query->get_result();
 }
-function scan_code_candidates($value) {
-	$value = trim((string)$value);
-	if ($value === '') return [];
-	$candidates = [$value, trim(str_replace(["\r", "\n", "\t"], '', $value))];
-	$decoded = rawurldecode($value);
-	if ($decoded !== $value) $candidates[] = trim($decoded);
-	$json = json_decode($value, true);
-	if (is_array($json)) {
-		foreach (['student_id', 'student_no', 'qr', 'qr_code', 'barcode', 'code', 'id'] as $key) {
-			if (!empty($json[$key]) && is_scalar($json[$key])) $candidates[] = trim((string)$json[$key]);
-		}
-	}
-	$url = filter_var($value, FILTER_VALIDATE_URL) ? parse_url($value) : false;
-	if (is_array($url)) {
-		$path = trim((string)($url['path'] ?? ''), '/');
-		if ($path !== '') $candidates[] = basename($path);
-		parse_str((string)($url['query'] ?? ''), $query);
-		foreach (['student_id', 'student_no', 'qr', 'qr_code', 'barcode', 'code', 'id'] as $key) {
-			if (!empty($query[$key]) && is_scalar($query[$key])) $candidates[] = trim((string)$query[$key]);
-		}
-	}
-	return array_values(array_unique(array_filter($candidates, function ($candidate) { return $candidate !== ''; })));
-}
-
-$raw = file_get_contents('php://input');
-$json = json_decode($raw, true);
-$json = is_array($json) ? $json : [];
-$code = trim((string)($json['code'] ?? $_POST['code'] ?? $_POST['qr'] ?? ''));
-$scanType = strtolower(trim((string)($json['scan_type'] ?? $_POST['scan_type'] ?? 'qr_or_barcode')));
-$eventId = (int)($json['event_id'] ?? $_POST['event_id'] ?? 0);
-
-if ($code === '' || strlen($code) > 255 || $eventId <= 0) {
-	scan_response(['ok' => false, 'success' => false, 'title' => 'SCAN DENIED', 'message' => 'A valid student code and event are required.'], 400);
-}
-
-$eventStatement = $conn->prepare("SELECT * FROM events WHERE id=? AND status='ACTIVE' AND attendance_required=1 AND event_date=CURDATE() LIMIT 1");
-$eventStatement->bind_param('i', $eventId);
-$eventStatement->execute();
-$event = $eventStatement->get_result()->fetch_assoc();
-if (!$event) {
-	scan_response(['ok' => false, 'success' => false, 'title' => 'SCAN DENIED', 'message' => 'There is no active school event or activity.']);
-}
-$emergencyScanOut = get_ssc_setting('emergency_scan_out', '0') === '1';
-
-$studentStatement = $conn->prepare("SELECT id,student_no,first_name,last_name,course,year_level,section,qr_code FROM students WHERE account_status='ACTIVE' AND (student_no=? OR qr_code=?) LIMIT 1");
-$student = null;
-foreach (scan_code_candidates($code) as $candidate) {
-	$studentStatement->bind_param('ss', $candidate, $candidate);
-	$studentStatement->execute();
-	$student = $studentStatement->get_result()->fetch_assoc();
-	if ($student) break;
-}
-if (!$student) {
-	scan_response(['ok' => false, 'success' => false, 'title' => 'SCAN FAILED', 'message' => 'Student ID / QR / Barcode not registered.']);
-}
-
-$registration = $conn->prepare('SELECT 1 FROM event_students WHERE event_id=? AND student_id=? LIMIT 1');
-$registration->bind_param('ii', $eventId, $student['id']);
-$registration->execute();
-if (!$registration->get_result()->fetch_row()) {
-	$register = $conn->prepare('INSERT IGNORE INTO event_students(event_id,student_id) VALUES(?,?)');
-	$register->bind_param('ii', $eventId, $student['id']);
-	if (!$register->execute()) {
-		scan_response(['ok' => false, 'success' => false, 'title' => 'SCAN DENIED', 'message' => 'Student could not be connected to this event.']);
-	}
-}
-
-$conn->begin_transaction();
-$attendance = $conn->prepare('SELECT * FROM event_attendance WHERE event_id=? AND student_id=? FOR UPDATE');
-$attendance->bind_param('ii', $eventId, $student['id']);
-$attendance->execute();
-$record = $attendance->get_result()->fetch_assoc();
-$now = date('Y-m-d H:i:s');
-$name = $student['first_name'].' '.$student['last_name'];
-$scanner = $scanType === 'camera' ? 'CAMERA' : ($scanType === 'usb' ? 'USB SCANNER' : 'SCANNER');
-
-if (!$record) {
-	if (!event_window_open($event, 'IN')) {
-		$conn->rollback();
-			scan_response(['ok' => false, 'success' => false, 'title' => 'SCAN DENIED', 'message' => 'Scan In is currently closed.']);
-	}
-	$attendanceStatus = date('H:i:s') > $event['start_time'] ? 'LATE' : 'INCOMPLETE';
-	$insert = $conn->prepare('INSERT INTO event_attendance(student_id,event_id,scan_in,attendance_status,scanner,recorded_date) VALUES(?,?,?,?,?,CURDATE())');
-	$insert->bind_param('iisss', $student['id'], $eventId, $now, $attendanceStatus, $scanner);
-	if (!$insert->execute()) {
-		$conn->rollback();
-		scan_response(['ok' => false, 'success' => false, 'title' => 'SCAN FAILED', 'message' => 'Attendance could not be recorded.']);
-	}
-	$conn->commit();
-		scan_response(['ok' => true, 'success' => true, 'direction' => 'IN', 'title' => 'SCAN SUCCESSFUL', 'message' => 'Attendance recorded.', 'student' => $name, 'student_record_id' => (int)$student['id'], 'student_id' => $student['student_no'], 'grade' => $student['course'], 'section' => $student['section'], 'event' => $event['event_name'], 'scan_type' => $scanType, 'scan_in' => date('g:i:s A', strtotime($now)), 'scan_out' => null, 'status' => $attendanceStatus]);
-}
-
-if (!$record['scan_in']) {
-	$conn->rollback();
-	scan_response(['ok' => false, 'success' => false, 'title' => 'SCAN OUT DENIED', 'message' => 'You must scan in before scanning out.']);
-}
-if ($record['scan_out']) {
-	$conn->rollback();
-	scan_response(['ok' => false, 'success' => false, 'title' => 'ALREADY SCANNED OUT', 'message' => 'You have already completed your attendance for this event.', 'student' => $name, 'student_record_id' => (int)$student['id'], 'student_id' => $student['student_no'], 'grade' => $student['course'], 'section' => $student['section'], 'scan_in' => $record['scan_in'] ? date('g:i A', strtotime($record['scan_in'])) : null, 'scan_out' => $record['scan_out'] ? date('g:i A', strtotime($record['scan_out'])) : null, 'status' => 'SCAN OUT']);
-}
-if (!$emergencyScanOut && !event_window_open($event, 'OUT')) {
-	$conn->rollback();
-	scan_response(['ok' => false, 'success' => false, 'title' => 'ALREADY CHECKED IN', 'message' => 'Scan out is available from '.date('g:i A', strtotime($event['scan_out_start'])).' to '.date('g:i A', strtotime($event['scan_out_end'])).'.', 'student' => $name, 'student_record_id' => (int)$student['id'], 'student_id' => $student['student_no'], 'grade' => $student['course'], 'section' => $student['section'], 'scan_in' => date('g:i A', strtotime($record['scan_in'])), 'status' => 'PRESENT']);
-}
-
-$update = $conn->prepare("UPDATE event_attendance SET scan_out=?,attendance_status='PRESENT',scanner=? WHERE attendance_id=?");
-$update->bind_param('ssi', $now, $scanner, $record['attendance_id']);
-if (!$update->execute()) {
-	$conn->rollback();
-	scan_response(['ok' => false, 'success' => false, 'title' => 'SCAN FAILED', 'message' => 'Attendance could not be updated.']);
-}
-$conn->commit();
-	scan_response(['ok' => true, 'success' => true, 'direction' => 'OUT', 'title' => 'SCAN OUT SUCCESSFUL', 'message' => 'Scan out recorded.', 'student' => $name, 'student_record_id' => (int)$student['id'], 'student_id' => $student['student_no'], 'grade' => $student['course'], 'section' => $student['section'], 'event' => $event['event_name'], 'scan_type' => $scanType, 'scan_in' => $record['scan_in'] ? date('g:i:s A', strtotime($record['scan_in'])) : null, 'scan_out' => date('g:i:s A', strtotime($now)), 'status' => 'PRESENT']);
+?><!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Student Entry</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="assets/app.js" defer></script>
+<style>
+@media(max-width:640px){main{padding:.75rem!important}.scan-frame{height:12rem!important}.glass{border-radius:1rem!important;padding:1rem!important}.glass .flex.items-center.justify-between{align-items:flex-start;flex-direction:column;gap:.75rem}.glass .flex.items-center.justify-between>div:last-child{width:100%;display:flex;flex-wrap:wrap;gap:.5rem}.glass .flex.items-center.justify-between a,.glass .flex.items-center.justify-between button{flex:1;text-align:center}.glass table{font-size:.75rem}.glass th,.glass td{padding:.5rem}.glass .h-8{height:auto;min-height:2rem}}
+.scan-frame{position:relative}.scan-sweep{position:absolute;left:0;right:0;height:3px;background:linear-gradient(90deg,transparent,rgba(16,185,129,.9),transparent);box-shadow:0 0 12px rgba(16,185,129,.6)}
+ .camera-modal{background:rgba(15,23,42,.72);backdrop-filter:blur(10px)}.camera-preview{aspect-ratio:4/3;object-fit:cover;background:#0f172a}.camera-frame{box-shadow:0 0 0 2px rgba(16,185,129,.5),0 0 28px rgba(16,185,129,.25) inset}
+@keyframes sweep{0%{top:8%}50%{top:92%}100%{top:8%}}.animate-sweep{animation:sweep 1.8s ease-in-out infinite}.pulse-ring{position:absolute;inset:-10px;border-radius:16px;box-shadow:0 0 0 0 rgba(16,185,129,.35);animation:pulse 1.2s ease-out 1}@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(16,185,129,.45)}100%{box-shadow:0 0 0 24px rgba(16,185,129,0)}}.shake{animation:shake .35s ease-in-out 1}@keyframes shake{10%,90%{transform:translateX(-1px)}20%,80%{transform:translateX(2px)}30%,50%,70%{transform:translateX(-4px)}40%,60%{transform:translateX(4px)}}.aurora{position:absolute;filter:blur(60px);opacity:.55}.aurora.a1{width:50vw;height:50vw;left:-10vw;top:-10vh;background:radial-gradient(closest-side,rgba(16,185,129,.7),transparent 60%)}.aurora.a2{width:60vw;height:60vw;right:-20vw;top:-20vh;background:radial-gradient(closest-side,rgba(99,102,241,.5),transparent 60%)}.glass{background-color:rgba(255,255,255,.55);backdrop-filter:saturate(140%) blur(14px)}.neon-border{box-shadow:0 0 0 2px rgba(16,185,129,.35),0 0 24px rgba(16,185,129,.35) inset}.exit-mode{border-color:rgba(248,113,113,.9)!important}
+.SSC-failed-modal{position:relative;width:min(88vw,23rem);aspect-ratio:1/0.98;padding:4.75rem 3rem 2.35rem;clip-path:polygon(50% 0,100% 100%,0 100%);background:linear-gradient(145deg,#ff6b7d 0%,#e11d35 50%,#991b1b 100%);filter:drop-shadow(0 22px 26px rgba(127,29,29,.42));text-align:center;color:#fff;isolation:isolate;overflow:hidden;animation:failed-pop .22s cubic-bezier(.22,1,.36,1) both}.SSC-failed-modal:after{content:"";position:absolute;inset:8px;z-index:0;clip-path:inherit;border:1px solid rgba(255,255,255,.3);background:linear-gradient(155deg,rgba(255,255,255,.16),transparent 42%)}.SSC-failed-modal>*{position:relative;z-index:1}.SSC-failed-sheen{position:absolute!important;top:9%;left:18%;width:64%;height:25%;z-index:0!important;border-radius:50%;background:rgba(255,255,255,.13);filter:blur(18px);transform:rotate(-12deg)}.SSC-failed-mark{display:flex;width:3.35rem;height:3.35rem;margin:0 auto .85rem;align-items:center;justify-content:center;border:3px solid rgba(255,255,255,.95);border-radius:50%;background:#fff;color:#d71935;font-size:2.05rem;font-weight:900;line-height:1;box-shadow:0 5px 0 rgba(127,29,29,.25),0 0 0 7px rgba(255,255,255,.14)}.SSC-failed-mark span{transform:translateY(-1px)}.SSC-failed-title{display:flex;flex-direction:column;align-items:center;line-height:.88;text-shadow:0 2px 0 rgba(127,29,29,.22)}.SSC-failed-title span{font-size:.73rem;font-weight:800;letter-spacing:.42em;transform:translateX(.21em);opacity:.86}.SSC-failed-title strong{font-size:2.45rem;font-weight:950;letter-spacing:-.035em}.SSC-failed-rule{width:2.9rem;height:3px;margin:.8rem auto .65rem;border-radius:999px;background:rgba(255,255,255,.72)}.SSC-failed-message{margin:0 auto;max-width:15rem;font-size:.88rem;line-height:1.35;color:rgba(255,255,255,.9)}.SSC-failed-progress{position:absolute;right:25%;bottom:1.55rem;left:25%;height:.32rem;overflow:hidden;border:1px solid rgba(255,255,255,.25);border-radius:999px;background:rgba(127,29,29,.2)}.SSC-failed-progress .SSC-modal-progress{height:100%;width:100%;border-radius:inherit;background:rgba(255,255,255,.95);box-shadow:0 0 9px rgba(255,255,255,.7)}@media(max-width:380px){.SSC-failed-modal{padding-right:2.2rem;padding-left:2.2rem}.SSC-failed-title strong{font-size:2.1rem}.SSC-failed-message{font-size:.8rem}}@keyframes failed-pop{from{opacity:0;transform:scale(.82) translateY(8px)}to{opacity:1;transform:scale(1) translateY(0)}}
+.SSC-failed-modal{width:min(90vw,25rem);aspect-ratio:auto;min-height:20rem;padding:2.4rem 2.25rem 2.1rem;clip-path:none;border:1px solid rgba(255,255,255,.42);border-radius:1.5rem;background:linear-gradient(145deg,#ff6b7d 0%,#e11d35 50%,#991b1b 100%);box-shadow:0 22px 50px rgba(127,29,29,.4),inset 0 1px 0 rgba(255,255,255,.25);animation:failed-alert-in .65s cubic-bezier(.22,1,.36,1) both}.SSC-failed-modal:after{inset:7px;clip-path:none;border-radius:1.1rem;background:linear-gradient(155deg,rgba(255,255,255,.13),transparent 42%)}.SSC-failed-sheen{top:0;left:18%;width:64%;height:34%}.SSC-failed-mark{margin-bottom:1rem}.SSC-failed-progress{right:2.25rem;bottom:1.65rem;left:2.25rem}@keyframes failed-alert-in{0%{opacity:0;transform:scale(.86) translateX(0)}18%{opacity:1;transform:scale(1.02) translateX(-7px)}34%{transform:scale(1) translateX(7px)}50%{transform:translateX(-5px)}66%{transform:translateX(4px)}82%{transform:translateX(-2px)}100%{opacity:1;transform:translateX(0)}}@media(max-width:380px){.SSC-failed-modal{min-height:19rem;padding-right:1.5rem;padding-left:1.5rem}.SSC-failed-progress{right:1.5rem;left:1.5rem}}
+</style><style>.SSC-success-modal{position:relative;width:min(90vw,25rem);min-height:20rem;padding:2.4rem 2.25rem 2.1rem;overflow:hidden;border:1px solid rgba(255,255,255,.55);border-radius:1.5rem;background:linear-gradient(145deg,#34d399 0%,#059669 52%,#047857 100%);box-shadow:0 22px 50px rgba(6,95,70,.42),inset 0 1px 0 rgba(255,255,255,.3);text-align:center;color:#fff;isolation:isolate;animation:success-alert-in .45s cubic-bezier(.22,1,.36,1) both}.SSC-success-modal>*{position:relative;z-index:1}.SSC-success-sheen{position:absolute!important;top:0;left:18%;width:64%;height:34%;z-index:0!important;border-radius:50%;background:rgba(255,255,255,.16);filter:blur(18px);transform:rotate(-12deg)}.SSC-success-mark{display:flex;width:4.25rem;height:4.25rem;margin:0 auto 1rem;align-items:center;justify-content:center;border:4px solid rgba(255,255,255,.96);border-radius:50%;background:#fff;color:#059669;font-size:2.7rem;font-weight:900;line-height:1;box-shadow:0 6px 0 rgba(6,95,70,.28),0 0 0 8px rgba(255,255,255,.16);animation:success-check-pop .55s cubic-bezier(.22,1,.36,1) both}.SSC-success-title{display:flex;flex-direction:column;align-items:center;line-height:.9;text-shadow:0 2px 0 rgba(6,95,70,.22)}.SSC-success-title span{font-size:.75rem;font-weight:800;letter-spacing:.42em;transform:translateX(.21em);opacity:.88}.SSC-success-title strong{font-size:2.2rem;font-weight:950}.SSC-success-rule{width:3rem;height:3px;margin:.85rem auto .7rem;border-radius:999px;background:rgba(255,255,255,.78)}.SSC-success-message{margin:0 auto;max-width:19rem;font-size:.98rem;line-height:1.4;color:rgba(255,255,255,.96)}.SSC-success-student{margin:1rem auto 0;max-width:19rem;padding:.75rem;border:1px solid rgba(255,255,255,.22);border-radius:.85rem;background:rgba(6,95,70,.2);font-size:.85rem;line-height:1.55;text-align:left}.SSC-success-progress{position:absolute;right:2.25rem;bottom:1.65rem;left:2.25rem;height:.32rem;overflow:hidden;border:1px solid rgba(255,255,255,.3);border-radius:999px;background:rgba(6,95,70,.22)}.SSC-success-progress .SSC-modal-progress{height:100%;background:#fff}@keyframes success-alert-in{0%{opacity:0;transform:scale(.86)}100%{opacity:1;transform:scale(1)}}@keyframes success-check-pop{0%{opacity:0;transform:scale(.4) rotate(-20deg)}70%{transform:scale(1.12) rotate(4deg)}100%{opacity:1;transform:scale(1) rotate(0)}}
+</style><style>.SSC-success-mark{overflow:visible}.SSC-success-mark svg{width:3.8rem;height:3.8rem;overflow:visible;transform:scale(1.08)}.SSC-success-mark path{fill:none;stroke:currentColor;stroke-linecap:round;stroke-linejoin:round;stroke-width:6;stroke-dasharray:58;stroke-dashoffset:58;animation:success-check-draw .65s .18s cubic-bezier(.65,0,.35,1) forwards}@keyframes success-check-draw{to{stroke-dashoffset:0}}</style>
+</head>
+<body class="opacity-0 translate-y-1 text-slate-800">
+<div class="relative min-h-screen overflow-hidden"><div class="aurora a1"></div><div class="aurora a2"></div>
+<div class="relative flex min-h-screen items-center"><main class="mx-auto w-full max-w-5xl p-3 sm:p-6">
+  <div class="mb-4 flex flex-wrap items-center justify-between gap-3 sm:mb-6"><div class="flex items-center gap-3"><span class="inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-100 px-3 py-1 text-xs text-emerald-700">ENTRY</span><div id="clock" class="text-sm text-slate-600"></div></div><div class="flex items-center gap-2"><button id="cameraBtn" type="button" class="inline-flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50/80 px-3 py-1 text-sm text-emerald-700 transition hover:bg-emerald-100" title="Open camera scanner"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M9 4l1.5-2h3L15 4h3a3 3 0 0 1 3 3v10a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3V7a3 3 0 0 1 3-3zm3 4a5 5 0 1 0 0 10a5 5 0 0 0 0-10m0 2.2a2.8 2.8 0 1 1 0 5.6a2.8 2.8 0 0 1 0-5.6"/></svg>Camera</button><button id="kioskBtn" class="rounded-lg border bg-white/70 px-3 py-1 text-sm transition hover:bg-white">Enter Kiosk</button><a href="index.php" class="rounded-lg border bg-white/70 px-3 py-1 text-sm transition hover:bg-white">Home</a></div></div>
+  <div id="scanApp" class="glass relative overflow-hidden rounded-3xl border border-emerald-200/60 p-6 shadow-xl"><input id="qrHidden" autocomplete="off" autofocus aria-hidden="true" class="absolute h-px w-px opacity-0" <?php echo $event?'':'disabled'; ?>><div id="frame" class="scan-frame neon-border relative flex h-48 items-center sm:h-60 justify-center rounded-2xl border-2 border-emerald-300/80 bg-white/40"><div class="scan-sweep animate-sweep"></div><div id="scanMsg" class="font-medium tracking-wide text-emerald-700/80">Waiting for scan...</div></div><div id="status" class="mt-4 h-8 text-sm text-slate-600">Place Student ID, QR Code, or Barcode in front of the Scanner</div><div id="flash" class="absolute inset-0 hidden rounded-3xl bg-emerald-200/40"></div><div id="result" class="hidden" aria-hidden="true"></div></div>
+  <div class="glass mt-6 rounded-3xl border border-slate-200/60 p-4 shadow"><div class="mb-2 flex items-center justify-between">  <div class="text-lg font-semibold">Recent Student Entries / Exit</div><div class="text-xs text-slate-500">Last 10</div></div><div class="overflow-x-auto"><table class="min-w-full text-sm"><thead><tr class="border-b border-slate-200/60 text-left text-slate-600"><th class="px-2 py-2">Name</th><th class="px-2 py-2">Course / Grade / Section</th><th class="px-2 py-2">Scan In</th><th class="px-2 py-2">Scan Out</th><th class="px-2 py-2">Status</th></tr></thead><tbody id="recentRows"><?php if($event && $recent): while($row=$recent->fetch_assoc()): ?><tr class="border-b border-white/60"><td class="px-2 py-2 font-medium"><?php echo h($row['last_name'].', '.$row['first_name']); ?></td><td class="px-2 py-2 text-slate-600"><?php echo h(($row['course']??'').' / '.($row['year_level']??'').' / '.($row['section']??'')); ?></td><td class="px-2 py-2"><?php echo $row['scan_in']?h(date('g:i A',strtotime($row['scan_in']))):'--'; ?></td><td class="px-2 py-2"><?php echo $row['scan_out']?h(date('g:i A',strtotime($row['scan_out']))):'--'; ?></td><td class="px-2 py-2"><span class="rounded bg-slate-100 px-2 py-1 text-xs"><?php echo h($row['attendance_status']); ?></span></td></tr><?php endwhile; else: ?><tr><td colspan="5" class="px-2 py-6 text-center text-slate-500">Waiting for scan...</td></tr><?php endif; ?></tbody></table></div></div>
+</main></div></div>
+<div id="cameraModal" class="camera-modal fixed inset-0 z-50 hidden items-center justify-center p-4"><div class="w-full max-w-lg overflow-hidden rounded-3xl border border-white/70 bg-white shadow-2xl"><div class="flex items-center justify-between border-b border-slate-200 px-5 py-4"><div><div class="text-lg font-bold text-slate-900">Camera Scanner</div><div class="text-xs text-slate-500">Point the camera at a QR code or barcode.</div></div><button id="closeCamera" type="button" class="rounded-full border border-slate-200 px-3 py-1 text-lg leading-none text-slate-600 hover:bg-slate-50" aria-label="Close camera">&times;</button></div><div class="bg-slate-950 p-4"><div class="camera-frame relative overflow-hidden rounded-2xl"><video id="cameraVideo" class="camera-preview block w-full" autoplay muted playsinline></video><div class="pointer-events-none absolute inset-[14%] rounded-2xl border-2 border-emerald-400/90 shadow-[0_0_0_999px_rgba(15,23,42,.28)]"><div class="scan-sweep animate-sweep"></div></div></div><div id="cameraStatus" class="mt-3 text-center text-sm text-slate-200">Starting camera...</div></div><div class="flex justify-end gap-2 px-5 py-4"><button id="switchCamera" type="button" class="rounded-lg border border-slate-200 px-4 py-2 text-sm text-slate-700 hover:bg-slate-50">Front camera</button><button id="cameraCancel" type="button" class="rounded-lg border border-slate-200 px-4 py-2 text-sm text-slate-700 hover:bg-slate-50">Cancel</button></div></div></div>
+<style>.SSC-failed-mark{overflow:visible}.SSC-failed-mark svg{width:3rem;height:3rem;overflow:visible}.SSC-failed-mark path{fill:none;stroke:currentColor;stroke-linecap:round;stroke-linejoin:round;stroke-width:5.5;stroke-dasharray:68;stroke-dashoffset:68;animation:failed-x-draw .38s .08s cubic-bezier(.65,0,.35,1) infinite}@keyframes failed-x-draw{0%,8%{stroke-dashoffset:68}42%,62%{stroke-dashoffset:0}100%{stroke-dashoffset:68}}</style><script src="assets/js/zxing-browser.min.js"></script>
+<script>
+window.SSC_SCAN_CONFIG=<?php echo json_encode(['eventId'=>$event?(int)$event['id']:0,'api'=>'api/scan.php','logo'=>'system/img/logo.jpg','modalSeconds'=>(float)get_ssc_setting('modal_seconds','2'),'audioVolume'=>(float)get_ssc_setting('audio_volume','0.28')]); ?>;
+var clock=document.getElementById('clock');function tick(){clock.textContent=new Date().toLocaleString('en-PH',{dateStyle:'medium',timeStyle:'medium'})}tick();setInterval(tick,1000);
+var kiosk=document.getElementById('kioskBtn');kiosk.addEventListener('click',function(){if(!document.fullscreenElement)document.documentElement.requestFullscreen();else document.exitFullscreen()});document.addEventListener('fullscreenchange',function(){kiosk.textContent=document.fullscreenElement?'Exit Kiosk':'Enter Kiosk'});
+var cameraModal=document.getElementById('cameraModal'),cameraVideo=document.getElementById('cameraVideo'),cameraStatus=document.getElementById('cameraStatus'),switchCamera=document.getElementById('switchCamera'),cameraStream=null,cameraFrame=null,cameraDetector=null,cameraBusy=false,cameraSessionLocked=false,usingFrontCamera=false;function stopCamera(){if(cameraFrame){cancelAnimationFrame(cameraFrame);cameraFrame=null}if(cameraStream){cameraStream.getTracks().forEach(function(track){track.stop()});cameraStream=null}cameraVideo.srcObject=null}function closeCamera(){stopCamera();cameraModal.classList.add('hidden');cameraModal.classList.remove('flex');if(document.getElementById('qrHidden'))document.getElementById('qrHidden').focus()}async function submitCameraCode(code){if(!code||cameraSessionLocked)return;cameraSessionLocked=true;cameraBusy=true;window.SSC_SCAN_CONFIG.scanType='camera';document.getElementById('qrHidden').value=code;document.getElementById('qrHidden').dispatchEvent(new Event('input',{bubbles:true}));closeCamera()}async function scanCameraFrame(){if(!cameraStream||cameraBusy||cameraSessionLocked||!cameraDetector)return;try{var results=await cameraDetector.detect(cameraVideo);if(results.length){var code=String(results[0].rawValue||'').trim();if(code){submitCameraCode(code);return}}}catch(error){}cameraFrame=requestAnimationFrame(scanCameraFrame)}async function openCamera(){cameraSessionLocked=false;cameraBusy=false;cameraModal.classList.remove('hidden');cameraModal.classList.add('flex');cameraStatus.textContent='Waiting for camera...';if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){cameraStatus.textContent='Camera access is not supported on this browser.';return}try{cameraStream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:usingFrontCamera?'user':'environment'},width:{ideal:1280},height:{ideal:720}},audio:false});cameraVideo.srcObject=cameraStream;await cameraVideo.play();cameraDetector=null;if('BarcodeDetector' in window){try{var formats=['qr_code','code_128','code_39','ean_13','ean_8','upc_a','upc_e','codabar','itf'];if(BarcodeDetector.getSupportedFormats){var supported=await BarcodeDetector.getSupportedFormats();formats=formats.filter(function(format){return supported.indexOf(format)!==-1})}cameraDetector=formats.length?new BarcodeDetector({formats:formats}):null}catch(detectorError){cameraDetector=null}}cameraStatus.textContent=cameraDetector?'Scanning QR/barcode...':'Camera is open. Starting local decoder...';if(cameraDetector)cameraFrame=requestAnimationFrame(scanCameraFrame)}catch(error){cameraStatus.textContent=error.name==='NotAllowedError'?'Camera permission denied. Allow camera access and try again.':'Unable to start the camera. Check camera permission and use HTTPS or localhost.'}}async function toggleCamera(){usingFrontCamera=!usingFrontCamera;stopCamera();switchCamera.textContent=usingFrontCamera?'Back camera':'Front camera';await openCamera()}document.getElementById('cameraBtn').addEventListener('click',openCamera);document.getElementById('closeCamera').addEventListener('click',closeCamera);document.getElementById('cameraCancel').addEventListener('click',closeCamera);switchCamera.addEventListener('click',toggleCamera);cameraModal.addEventListener('click',function(event){if(event.target===cameraModal)closeCamera()});if(new URLSearchParams(window.location.search).get('camera')==='1')window.addEventListener('load',openCamera);
+</script>
+<script>(function(){var fallbackReader=null,fallbackStarted=false;function startFallback(){if(fallbackStarted||!window.ZXingBrowser||!cameraVideo||!cameraStream)return;fallbackStarted=true;cameraStatus.textContent='Scanning QR/barcode...';fallbackReader=new ZXingBrowser.BrowserMultiFormatReader();fallbackReader.decodeFromVideoElement(cameraVideo,function(result){if(result&&result.text&&!cameraBusy){submitCameraCode(result.text.trim())}})}setInterval(function(){if(cameraModal&&!cameraModal.classList.contains('hidden')&&cameraStream&&!cameraDetector)startFallback();if(cameraModal&&cameraModal.classList.contains('hidden')&&fallbackReader){if(typeof fallbackReader.reset==='function')fallbackReader.reset();fallbackReader=null;fallbackStarted=false}},300)})();</script>
+<script src="assets/camera-guard.js?v=1"></script><script src="assets/scan.js?v=3" defer></script>
+</body></html>
